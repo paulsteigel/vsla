@@ -2,16 +2,24 @@ import axios from 'axios'
 
 const BASE_URL = import.meta.env.VITE_API_URL || 'https://apis.care.org.vn'
 
-export const http = axios.create({ baseURL: BASE_URL })
-export const httpAuth = axios.create({ baseURL: BASE_URL })
+const wrap = async (promise) => {
+  try {
+    const res = await promise
+    return { status: res.status, payload: res.data }
+  } catch (err) {
+    return { status: err.response?.status || 500, payload: err.response?.data }
+  }
+}
 
-httpAuth.interceptors.request.use((config) => {
+const instance = axios.create({ baseURL: BASE_URL })
+
+instance.interceptors.request.use((config) => {
   const token = localStorage.getItem('accessToken')
   if (token) config.headers.Authorization = `Bearer ${token}`
   return config
 })
 
-httpAuth.interceptors.response.use(
+instance.interceptors.response.use(
   (res) => res,
   (err) => {
     if (err.response?.status === 401) {
@@ -21,3 +29,11 @@ httpAuth.interceptors.response.use(
     return Promise.reject(err)
   }
 )
+
+export const httpAuth = {
+  get:    (url) => wrap(instance.get(url)),
+  post:   (url, data) => wrap(instance.post(url, data)),
+  patch:  (url, data) => wrap(instance.patch(url, data)),
+  delete: (url) => wrap(instance.delete(url)),
+}
+export const http = httpAuth
