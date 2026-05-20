@@ -1,0 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Poppins', sans-serif; background: #FAFBFC; color: #24272C; }
+
+/* Ant Design table header override */
+.ant-table-thead > tr > th {
+  background-color: #E4701E !important;
+  color: #ffffff !important;
+  font-weight: 600 !important;
+}
+.title-row-high-light {
+  background-color: #FFF4DE !important;
+  font-weight: 700;
+}
+.title-row-high-light td { font-weight: 700 !important; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #f1f1f1; }
+::-webkit-scrollbar-thumb { background: #E4701E; border-radius: 3px; }
