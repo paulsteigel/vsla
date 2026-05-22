@@ -1,6 +1,6 @@
-// [paulsteigel - 2026-05-22] MANAGEMENT VIEW v3 — Financial health focus, period filter, meeting compliance
-// Redesigned for PROJECT_ADMIN / CITY_ADMIN / WARD_ADMIN perspective
-// Key changes: +Savings/Loans/Repayment KPIs, +Period selector, +Meeting type breakdown, -Posts KPI
+// [paulsteigel - 2026-05-22] MANAGEMENT COMMAND CENTER v3
+// Radical redesign: exception-first, threshold-aware, three-persona view
+// Personas: Project Manager / MEAL Officer / Government Official
 
 import { useEffect, useState, useMemo, useCallback } from 'react'
 import { Link } from 'react-router-dom'
@@ -11,187 +11,218 @@ import dayjs from 'dayjs'
 import {
   AreaChart, Area, BarChart, Bar,
   XAxis, YAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer, Legend, Cell
+  ResponsiveContainer, Cell
 } from 'recharts'
 
 const { RangePicker } = DatePicker
 
-// ─── Formatters ──────────────────────────────────────────────────────────────
-const fmtVN    = (n) => Number(n || 0).toLocaleString('vi-VN')
-const fmtM     = (n) => {                  // compact millions/billions
+// ─── Thresholds (VSLA best practice) ─────────────────────────────────────────
+const THRESHOLDS = {
+  repayment:      { good: 95, warn: 80 },   // % hoàn trả
+  attendance:     { good: 80, warn: 65 },   // % tham dự
+  activeMember:   { good: 75, warn: 60 },   // % thành viên HĐ
+  dataFreshness:  { good: 85, warn: 60 },   // % nhóm cập nhật < 30 ngày
+  meetingCompliance: { good: 90, warn: 70 },
+}
+
+// ─── Formatters ───────────────────────────────────────────────────────────────
+const fmtVN  = (n) => Number(n || 0).toLocaleString('vi-VN')
+const fmtM   = (n) => {
   const v = Number(n || 0)
   if (v >= 1_000_000_000) return `${(v / 1_000_000_000).toFixed(1)} tỷ`
   if (v >= 1_000_000)     return `${(v / 1_000_000).toFixed(1)} tr`
-  return fmtVN(v)
+  if (v > 0)              return fmtVN(Math.round(v))
+  return '—'
 }
-const fmtPct   = (v, max = 100) => max > 0 ? Math.min(Math.round((v / max) * 100), 100) : 0
+const fmtPct = (v, max = 100) => max > 0 ? Math.min(Math.round((v / max) * 100), 100) : 0
+const pct    = (v, max) => max > 0 ? Math.round((v / max) * 100) : 0
 
-// ─── Constants ───────────────────────────────────────────────────────────────
+// ─── Health scoring ───────────────────────────────────────────────────────────
+const healthColor = (value, threshold) => {
+  if (!threshold || value === 0) return 'gray'
+  if (value >= threshold.good) return 'green'
+  if (value >= threshold.warn) return 'amber'
+  return 'red'
+}
+const healthCls = {
+  green: { bg: 'bg-green-50', border: 'border-green-200', text: 'text-green-700', dot: 'bg-green-500', bar: '#16A34A' },
+  amber: { bg: 'bg-amber-50', border: 'border-amber-200', text: 'text-amber-700', dot: 'bg-amber-500', bar: '#D97706' },
+  red:   { bg: 'bg-red-50',   border: 'border-red-200',   text: 'text-red-700',   dot: 'bg-red-500',   bar: '#DC2626' },
+  gray:  { bg: 'bg-gray-50',  border: 'border-gray-200',  text: 'text-gray-500',  dot: 'bg-gray-400',  bar: '#9CA3AF' },
+}
+
 const ROLE_LABEL = {
-  ADMIN: 'Quản trị viên hệ thống',
-  ORGANIZATION_ADMIN: 'Quản lý tổ chức',
-  PROJECT_ADMIN: 'Quản lý dự án',
-  CITY_ADMIN: 'Cán bộ tỉnh',
-  WARD_ADMIN: 'Cán bộ xã',
+  ADMIN: 'Quản trị hệ thống', ORGANIZATION_ADMIN: 'Quản lý tổ chức',
+  PROJECT_ADMIN: 'Quản lý dự án', CITY_ADMIN: 'Cán bộ tỉnh', WARD_ADMIN: 'Cán bộ xã',
 }
-
-const MEETING_TYPE_LABEL = {
-  first_meeting:   'Họp đầu kỳ',
-  last_meeting:    'Họp cuối kỳ',
-  regular_meeting: 'Họp thường kỳ',
-}
-
-const MEETING_STATUS_CLS = {
-  Done:   'text-blue-600 bg-blue-50 border-blue-100',
-  Active: 'text-green-600 bg-green-50 border-green-100',
-}
-
-const LOAN_COLORS = ['#E4701E', '#16A34A', '#4079ED', '#9333EA']
-
-const greeting = () => {
-  const h = new Date().getHours()
-  return h < 12 ? 'Chào buổi sáng' : h < 18 ? 'Chào buổi chiều' : 'Chào buổi tối'
-}
+const MTG_TYPE = { first_meeting: 'Đầu kỳ', last_meeting: 'Cuối kỳ', regular_meeting: 'Thường kỳ' }
 
 // ─── Skeleton ─────────────────────────────────────────────────────────────────
-const Sk = ({ h = 'h-4', w = 'w-full', cls = '' }) => (
-  <div className={`animate-pulse bg-gray-100 rounded-lg ${h} ${w} ${cls}`} />
+const Sk = ({ h = 'h-4', w = 'w-full', r = 'rounded-lg' }) => (
+  <div className={`animate-pulse bg-gray-100 ${r} ${h} ${w}`} />
 )
 
-// ─── Progress Ring ─────────────────────────────────────────────────────────────
-function ProgressRing({ value = 0, max = 100, color = '#E4701E', size = 72, label, sub }) {
-  const pct = fmtPct(value, max)
-  const r   = (size - 10) / 2
-  const c   = 2 * Math.PI * r
-  const off = c - (pct / 100) * c
+// ─── Traffic light dot ────────────────────────────────────────────────────────
+function StatusDot({ color = 'gray', size = 'w-2.5 h-2.5', pulse = false }) {
+  const c = healthCls[color]
   return (
-    <div className="flex items-center gap-3">
-      <svg width={size} height={size} className="shrink-0">
-        <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="#F0F0F0" strokeWidth="8"/>
-        <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={color} strokeWidth="8"
-          strokeDasharray={c} strokeDashoffset={off} strokeLinecap="round"
-          style={{ transformOrigin:'center', transform:'rotate(-90deg)', transition:'stroke-dashoffset 0.8s ease' }}/>
-        <text x={size/2} y={size/2 + 5} textAnchor="middle" fontSize="12" fontWeight="700" fill="#24272C">
-          {pct}%
-        </text>
-      </svg>
-      <div>
-        <p className="font-[600] text-[13px] font-manrope text-main-title leading-tight">{label}</p>
-        {sub && <p className="text-[12px] text-gray-400 font-inter mt-0.5">{sub}</p>}
-      </div>
-    </div>
+    <span className="relative flex shrink-0">
+      {pulse && color === 'red' && (
+        <span className={`animate-ping absolute inline-flex h-full w-full rounded-full ${c.dot} opacity-60`}/>
+      )}
+      <span className={`relative inline-flex rounded-full ${size} ${c.dot}`}/>
+    </span>
   )
 }
 
-// ─── KPI Card ─────────────────────────────────────────────────────────────────
-function KPICard({ icon, bg, label, value, sub, trend, trendUp, to, loading }) {
+// ─── Threshold meter ──────────────────────────────────────────────────────────
+function ThresholdMeter({ value = 0, threshold, label, sub, delta, unit = '%', loading }) {
+  const color  = healthColor(value, threshold)
+  const cls    = healthCls[color]
+  const thPct  = threshold ? (threshold.good / 100) * 100 : null
+
   return (
-    <div className={`${bg} rounded-2xl p-4`}>
+    <div className={`rounded-xl border p-4 ${cls.bg} ${cls.border}`}>
       {loading ? (
-        <div className="space-y-2"><Sk h="h-7" w="w-8"/><Sk h="h-6" w="w-28"/><Sk h="h-4" w="w-36"/></div>
+        <div className="space-y-2"><Sk h="h-5" w="w-24"/><Sk h="h-8" w="w-16"/><Sk h="h-2"/></div>
       ) : (
         <>
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-xl">{icon}</span>
-            {trend !== undefined && (
-              <span className={`text-[11px] font-[600] px-2 py-0.5 rounded-full font-inter
-                ${trendUp ? 'text-green-700 bg-green-100' : 'text-red-700 bg-red-100'}`}>
-                {trendUp ? '▲' : '▼'} {trend}
-              </span>
+          <div className="flex items-start justify-between mb-1">
+            <p className="text-[12px] font-inter text-gray-text leading-tight">{label}</p>
+            <div className="flex items-center gap-1.5 shrink-0 ml-2">
+              <StatusDot color={color} size="w-2 h-2"/>
+              {delta !== undefined && delta !== 0 && (
+                <span className={`text-[11px] font-inter font-[600] ${delta > 0 ? 'text-green-600' : 'text-red-600'}`}>
+                  {delta > 0 ? '↑' : '↓'}{Math.abs(delta)}%
+                </span>
+              )}
+            </div>
+          </div>
+          <p className={`text-2xl font-bold font-manrope ${cls.text} leading-none mb-2`}>
+            {value > 0 ? `${value}${unit}` : '—'}
+          </p>
+          {/* Bar with threshold marker */}
+          <div className="relative h-1.5 bg-gray-200 rounded-full overflow-visible">
+            <div
+              className="absolute left-0 top-0 h-full rounded-full transition-all duration-700"
+              style={{ width: `${Math.min(value, 100)}%`, background: cls.bar }}
+            />
+            {thPct && (
+              <div
+                className="absolute top-[-3px] w-0.5 h-[9px] bg-gray-500 rounded-full"
+                style={{ left: `${thPct}%` }}
+                title={`Ngưỡng: ${threshold.good}%`}
+              />
             )}
           </div>
-          <p className="text-xl font-bold font-manrope text-main-title leading-tight">{value}</p>
-          <p className="text-[13px] text-gray-text font-inter mt-0.5">{label}</p>
-          {sub && (
-            to
-              ? <Link to={to} className="block mt-1 text-[12px] text-link font-inter hover:underline">{sub} →</Link>
-              : <p className="mt-1 text-[12px] text-gray-400 font-inter">{sub}</p>
-          )}
+          {sub && <p className="text-[11px] text-gray-400 font-inter mt-1.5">{sub}</p>}
         </>
       )}
     </div>
   )
 }
 
-// ─── Section wrapper ──────────────────────────────────────────────────────────
-function Section({ title, subtitle, to, action, children }) {
+// ─── Alert item ───────────────────────────────────────────────────────────────
+function AlertItem({ severity = 'warning', title, detail, to, action }) {
+  const cfg = {
+    critical: { icon: '🔴', bg: 'bg-red-50',    border: 'border-red-200',   text: 'text-red-800',   badge: 'Cần xử lý',  badgeCls: 'bg-red-100 text-red-700' },
+    warning:  { icon: '🟡', bg: 'bg-amber-50',  border: 'border-amber-200', text: 'text-amber-800', badge: 'Chú ý',     badgeCls: 'bg-amber-100 text-amber-700' },
+    info:     { icon: '🔵', bg: 'bg-blue-50',   border: 'border-blue-200',  text: 'text-blue-800',  badge: 'Thông tin', badgeCls: 'bg-blue-100 text-blue-700' },
+  }[severity]
+
+  const inner = (
+    <div className={`flex items-start gap-3 p-3 rounded-xl border ${cfg.bg} ${cfg.border} hover:opacity-90 transition-opacity`}>
+      <span className="text-base shrink-0 mt-0.5">{cfg.icon}</span>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 flex-wrap">
+          <p className={`text-[13px] font-[600] font-manrope ${cfg.text} leading-tight`}>{title}</p>
+          <span className={`text-[10px] font-inter font-[600] px-1.5 py-0.5 rounded-md ${cfg.badgeCls}`}>{cfg.badge}</span>
+        </div>
+        {detail && <p className="text-[12px] text-gray-500 font-inter mt-0.5 leading-snug">{detail}</p>}
+      </div>
+      {(to || action) && (
+        <span className="text-[12px] text-link font-inter shrink-0 mt-0.5">→</span>
+      )}
+    </div>
+  )
+  return to ? <Link to={to}>{inner}</Link> : <div onClick={action} className={action ? 'cursor-pointer' : ''}>{inner}</div>
+}
+
+// ─── Impact stat ──────────────────────────────────────────────────────────────
+function ImpactStat({ icon, value, label, sub, loading }) {
   return (
-    <div className="bg-white rounded-2xl p-5 border border-light-gray">
+    <div className="bg-white rounded-2xl border border-light-gray p-4 flex items-center gap-4">
+      <div className="w-12 h-12 rounded-xl bg-orange-bg/10 flex items-center justify-center text-2xl shrink-0">{icon}</div>
+      <div className="min-w-0">
+        {loading
+          ? <div className="space-y-1.5"><Sk h="h-7" w="w-24"/><Sk h="h-4" w="w-36"/></div>
+          : <>
+              <p className="text-xl font-bold font-manrope text-main-title leading-tight">{value}</p>
+              <p className="text-[13px] text-gray-text font-inter">{label}</p>
+              {sub && <p className="text-[11px] text-gray-400 font-inter">{sub}</p>}
+            </>
+        }
+      </div>
+    </div>
+  )
+}
+
+// ─── Section wrapper ──────────────────────────────────────────────────────────
+function Section({ title, subtitle, badge, to, children }) {
+  return (
+    <div className="bg-white rounded-2xl border border-light-gray p-5">
       <div className="flex items-start justify-between mb-4">
         <div>
-          <h3 className="font-bold text-[15px] font-manrope text-main-title">{title}</h3>
+          <div className="flex items-center gap-2">
+            <h3 className="font-bold text-[15px] font-manrope text-main-title">{title}</h3>
+            {badge && (
+              <span className="text-[11px] font-inter font-[600] px-2 py-0.5 rounded-full bg-orange-bg/10 text-orange-bg">{badge}</span>
+            )}
+          </div>
           {subtitle && <p className="text-[12px] text-gray-400 font-inter mt-0.5">{subtitle}</p>}
         </div>
-        <div className="flex items-center gap-2 shrink-0">
-          {action}
-          {to && (
-            <Link to={to} className="text-[12px] text-link font-inter hover:underline flex items-center gap-1">
-              Xem thêm <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="9 18 15 12 9 6"/></svg>
-            </Link>
-          )}
-        </div>
+        {to && (
+          <Link to={to} className="text-[12px] text-link font-inter hover:underline shrink-0 flex items-center gap-1 mt-0.5">
+            Xem thêm <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="9 18 15 12 9 6"/></svg>
+          </Link>
+        )}
       </div>
       {children}
     </div>
   )
 }
 
-// ─── Tooltip ──────────────────────────────────────────────────────────────────
 const CustomTooltip = ({ active, payload, label }) => {
   if (!active || !payload?.length) return null
   return (
-    <div className="bg-white border border-light-gray rounded-xl p-3 shadow-lg text-[12px] font-inter">
+    <div className="bg-white border border-light-gray rounded-xl p-3 shadow-sm text-[12px] font-inter">
       <p className="font-[600] text-main-title mb-1">{label}</p>
-      {payload.map((p, i) => (
-        <p key={i} style={{ color: p.color }}>
-          {p.name}: <strong>{fmtM(p.value)}</strong>
-        </p>
-      ))}
+      {payload.map((p, i) => <p key={i} style={{ color: p.color }}>{p.name}: <strong>{fmtM(p.value)}</strong></p>)}
     </div>
   )
 }
 
-// ─── Meeting type badge ───────────────────────────────────────────────────────
-function MeetingBadge({ type, count, loading }) {
-  const labels = {
-    first_meeting:   { label: 'Đầu kỳ',    cls: 'bg-purple-50 text-purple-700 border-purple-100' },
-    last_meeting:    { label: 'Cuối kỳ',   cls: 'bg-blue-50 text-blue-700 border-blue-100' },
-    regular_meeting: { label: 'Thường kỳ', cls: 'bg-green-50 text-green-700 border-green-100' },
-  }
-  const info = labels[type] || { label: type, cls: 'bg-gray-50 text-gray-600 border-gray-100' }
-  return (
-    <div className={`rounded-xl border px-3 py-2 text-center ${info.cls}`}>
-      {loading ? <Sk h="h-7" w="w-12" cls="mx-auto mb-1"/> : (
-        <p className="text-lg font-bold font-manrope">{fmtVN(count)}</p>
-      )}
-      <p className="text-[11px] font-inter font-[500] mt-0.5">{info.label}</p>
-    </div>
-  )
-}
-
-// ─── Main Component ───────────────────────────────────────────────────────────
+// ─── Main ─────────────────────────────────────────────────────────────────────
 export default function DashboardPage() {
   const { infoUser, roleUser } = useAuthStore()
 
-  // Period state: default = current month
-  const [period, setPeriod] = useState([
-    dayjs().startOf('month'),
-    dayjs().endOf('month'),
-  ])
-
-  // Data states
-  const [kpi, setKpi]           = useState({ groups: 0, activeGroups: 0, newGroups: 0, members: 0, activeMembers: 0, meetings: 0, meetingsByType: {} })
-  const [finance, setFinance]   = useState({ savings: 0, outstanding: 0, principal: 0, repaid: 0, interest: 0, socialFund: 0 })
-  const [loanPurpose, setLoan]  = useState([])
-  const [trendData, setTrend]   = useState([])
-  const [recentMtg, setRecent]  = useState([])
-  const [suggestions, setSugg]  = useState([])
-  const [loading, setLoading]   = useState(true)
-
+  const [period, setPeriod] = useState([dayjs().startOf('month'), dayjs()])
   const fromDate = period[0].format('YYYY-MM-DD')
   const toDate   = period[1].format('YYYY-MM-DD')
+  const prevFrom = period[0].subtract(1, 'month').format('YYYY-MM-DD')
+  const prevTo   = period[1].subtract(1, 'month').format('YYYY-MM-DD')
 
-  // Build scope params from roleUser (role-scoped queries)
+  // Data states
+  const [impact, setImpact]     = useState({ totalGroups: 0, activeGroups: 0, totalMembers: 0, activeMembers: 0, communityCapital: 0, coveredWards: 0, newGroupsPeriod: 0 })
+  const [finance, setFinance]   = useState({ savings: 0, outstanding: 0, principal: 0, repaid: 0, interest: 0, socialFund: 0 })
+  const [meal, setMeal]         = useState({ repaymentRate: 0, attendanceRate: 0, activeMemberRate: 0, meetingCompliance: 0 })
+  const [mealDelta, setDelta]   = useState({ repaymentRate: 0, attendanceRate: 0, activeMemberRate: 0 })
+  const [alerts, setAlerts]     = useState([])
+  const [trendData, setTrend]   = useState([])
+  const [loanPurpose, setLoan]  = useState([])
+  const [recentMtg, setRecent]  = useState([])
+  const [loading, setLoading]   = useState(true)
+
   const scopeParam = useMemo(() => {
     const p = {}
     if (roleUser?.projectId)      p.projectId      = roleUser.projectId
@@ -201,111 +232,154 @@ export default function DashboardPage() {
     return p
   }, [roleUser])
 
-  const buildQ = useCallback((extra = {}) => {
-    const params = { ...scopeParam, ...extra }
-    return Object.entries(params).map(([k, v]) => `${k}=${v}`).join('&')
-  }, [scopeParam])
+  const q = useCallback((extra = {}) =>
+    new URLSearchParams({ ...scopeParam, ...extra }).toString()
+  , [scopeParam])
 
   useEffect(() => {
     const load = async () => {
       setLoading(true)
-      const now   = dayjs()
+      const now    = dayjs()
+      const d45    = now.subtract(45, 'day').format('YYYY-MM-DD')
       const months = Array.from({ length: 6 }, (_, i) => {
         const m = now.subtract(5 - i, 'month')
-        return {
-          label: m.format('MM/YY'),
-          from:  m.startOf('month').format('YYYY-MM-DD'),
-          to:    m.endOf('month').format('YYYY-MM-DD'),
-        }
+        return { label: m.format('MM/YY'), from: m.startOf('month').format('YYYY-MM-DD'), to: m.endOf('month').format('YYYY-MM-DD') }
       })
 
       try {
-        // ── Parallel: core counts + report for period ──────────────────────
-        const [grpR, grpA, memR, mtgR, mtgFirst, mtgLast, mtgReg, rptR, latMR, sugR] =
+        // ── Core parallel fetch ───────────────────────────────────────────
+        const [allGrpR, actGrpR, allMemR, mtgPeriodR, mtgRecentR, latMtgR, rptCurrR, rptPrevR, suggR] =
           await Promise.allSettled([
-            httpAuth.get(`/groups?${buildQ()}`),                                      // all groups
-            httpAuth.get(`/groups?${buildQ({ status: 'Active' })}`),                  // active
-            httpAuth.get(`/customers?${buildQ()}`),                                   // all members
-            httpAuth.get(`/meetings?${buildQ({ fromDate, toDate })}`),                // meetings in period
-            httpAuth.get(`/meetings?${buildQ({ fromDate, toDate, meetingType: 'first_meeting' })}`),
-            httpAuth.get(`/meetings?${buildQ({ fromDate, toDate, meetingType: 'last_meeting' })}`),
-            httpAuth.get(`/meetings?${buildQ({ fromDate, toDate, meetingType: 'regular_meeting' })}`),
-            httpAuth.get(`/reports?reportType=overview_report_v2&fromDate=${fromDate}&toDate=${toDate}&${buildQ()}&_start=0&_end=100`),
-            httpAuth.get(`/meetings?${buildQ({ _start: 0, _end: 6 })}`),              // recent meetings
-            httpAuth.get(`/notifications?type=CUSTOMER_SUPPORT&_start=0&_end=6`),     // suggestions
+            httpAuth.get(`/groups?${q()}`),
+            httpAuth.get(`/groups?${q({ status: 'Active' })}`),
+            httpAuth.get(`/customers?${q()}`),
+            httpAuth.get(`/meetings?${q({ fromDate, toDate })}`),
+            httpAuth.get(`/meetings?${q({ fromDate: d45, toDate: now.format('YYYY-MM-DD'), _start: 0, _end: 500 })}`),
+            httpAuth.get(`/meetings?${q({ _start: 0, _end: 8 })}`),
+            httpAuth.get(`/reports?reportType=overview_report_v2&fromDate=${fromDate}&toDate=${toDate}&${q()}&_start=0&_end=100`),
+            httpAuth.get(`/reports?reportType=overview_report_v2&fromDate=${prevFrom}&toDate=${prevTo}&${q()}&_start=0&_end=100`),
+            httpAuth.get(`/notifications?type=CUSTOMER_SUPPORT&_start=0&_end=4`),
           ])
 
-        const vp = (r) => r.status === 'fulfilled' ? r.value?.payload : null
-        const vt = (r) => vp(r)?.total || 0
-        const vd = (r) => vp(r)?.data || []
+        const vp  = (r) => r.status === 'fulfilled' ? r.value?.payload : null
+        const vt  = (r) => vp(r)?.total || 0
+        const vd  = (r) => vp(r)?.data  || []
+        const rpt = (r, id) => (vd(r).find(x => String(x.id) === String(id))?.accumulatedValue) || 0
 
-        // ── KPI assembly ──────────────────────────────────────────────────
-        const rptData  = vd(rptR)
-        const gv       = (id) => rptData.find(r => String(r.id) === String(id))?.accumulatedValue || 0
-        const gvPeriod = (id) => rptData.find(r => String(r.id) === String(id))?.value || 0
+        const totalGroups   = vt(allGrpR)
+        const activeGroups  = vt(actGrpR)
+        const totalMembers  = rpt(rptCurrR, '4') || vt(allMemR)
+        const activeMembers = rpt(rptCurrR, '6')
+        const attendancePct = rpt(rptCurrR, '8')
 
-        // New groups in period (use period-scoped query)
-        const newGrpR = await httpAuth.get(`/groups?${buildQ({ fromDate, toDate })}`)
-        const newGroups = newGrpR?.payload?.total || 0
+        // Tìm nhóm chưa họp trong 45 ngày (approximate bằng set groupId)
+        const recentGroupIds = new Set(vd(mtgRecentR).map(m => m.groupId))
+        const inactiveCount  = Math.max(0, activeGroups - recentGroupIds.size)
 
-        setKpi({
-          groups:        vt(grpR),
-          activeGroups:  vt(grpA),
-          newGroups,
-          members:       gv('4') || vt(memR),
-          activeMembers: gv('6'),
-          meetings:      vt(mtgR),
-          meetingsByType: {
-            first_meeting:   vt(mtgFirst),
-            last_meeting:    vt(mtgLast),
-            regular_meeting: vt(mtgReg),
-          },
+        // Financial từ report
+        const savings     = rpt(rptCurrR, '5') || rpt(rptCurrR, '3')
+        const outstanding = rpt(rptCurrR, '9') || rpt(rptCurrR, '11')
+        const principal   = rpt(rptCurrR, '7') || rpt(rptCurrR, '10')
+        const repaid      = rpt(rptCurrR, '12')|| rpt(rptCurrR, '8.1')
+        const interest    = rpt(rptCurrR, '11')|| rpt(rptCurrR, '15')
+        const socialFund  = rpt(rptCurrR, '10')|| rpt(rptCurrR, '14')
+        const communityCapital = savings + outstanding + socialFund
+
+        // Prev period
+        const prevActiveMembers = rpt(rptPrevR, '6')
+        const prevAttendance    = rpt(rptPrevR, '8')
+        const prevRepaid        = rpt(rptPrevR, '12')|| rpt(rptPrevR, '8.1')
+        const prevPrincipal     = rpt(rptPrevR, '7') || rpt(rptPrevR, '10')
+        const prevRepaymentRate = prevPrincipal > 0 ? pct(prevRepaid, prevPrincipal) : 0
+        const prevActiveMemberRate = prevActiveMembers > 0 && totalMembers > 0
+          ? pct(prevActiveMembers, totalMembers) : 0
+
+        const repaymentRate    = principal > 0 ? pct(repaid, principal) : 0
+        const activeMemberRate = totalMembers > 0 ? pct(activeMembers, totalMembers) : 0
+        const meetingCount     = vt(mtgPeriodR)
+        // meeting compliance proxy: nhóm có meeting / active groups
+        const meetingCompliancePct = activeGroups > 0 ? pct(recentGroupIds.size, activeGroups) : 0
+
+        setImpact({ totalGroups, activeGroups, totalMembers, activeMembers, communityCapital, newGroupsPeriod: 0 })
+        setFinance({ savings, outstanding, principal, repaid, interest, socialFund })
+        setMeal({
+          repaymentRate,
+          attendanceRate: attendancePct,
+          activeMemberRate,
+          meetingCompliance: meetingCompliancePct,
+        })
+        setDelta({
+          repaymentRate:    repaymentRate    - prevRepaymentRate,
+          attendanceRate:   attendancePct    - (prevAttendance || 0),
+          activeMemberRate: activeMemberRate - prevActiveMemberRate,
         })
 
-        // ── Financial KPIs ────────────────────────────────────────────────
-        // Try known report keys; graceful zero on unknown
-        setFinance({
-          savings:    gv('5')  || gv('3')  || 0,   // accumulated savings/deposits
-          outstanding: gv('9') || gv('11') || 0,   // remaining principal
-          principal:  gv('7')  || gv('10') || 0,   // total disbursed
-          repaid:     gv('8.1')|| gv('12') || 0,   // total repaid principal
-          interest:   gv('11') || gv('15') || 0,   // interest collected
-          socialFund: gv('10') || gv('14') || 0,   // social/vaccine fund
-        })
+        // ── Build alerts ──────────────────────────────────────────────────
+        const newAlerts = []
 
-        // Loan purpose breakdown
+        if (inactiveCount > 0) {
+          newAlerts.push({
+            severity: inactiveCount > 5 ? 'critical' : 'warning',
+            title: `${inactiveCount} nhóm chưa họp trong 45 ngày qua`,
+            detail: 'Các nhóm này có thể đang gặp khó khăn hoặc chưa cập nhật dữ liệu.',
+            to: '/groups',
+          })
+        }
+
+        if (repaymentRate > 0 && repaymentRate < THRESHOLDS.repayment.warn) {
+          newAlerts.push({
+            severity: 'critical',
+            title: `Tỉ lệ hoàn trả thấp: ${repaymentRate}%`,
+            detail: `Ngưỡng an toàn là ${THRESHOLDS.repayment.warn}%. Cần rà soát danh sách vay.`,
+            to: '/groups',
+          })
+        } else if (repaymentRate > 0 && repaymentRate < THRESHOLDS.repayment.good) {
+          newAlerts.push({
+            severity: 'warning',
+            title: `Tỉ lệ hoàn trả chưa đạt: ${repaymentRate}%`,
+            detail: `Mục tiêu ${THRESHOLDS.repayment.good}%. Theo dõi sát các nhóm có dư nợ cao.`,
+            to: '/groups',
+          })
+        }
+
+        if (attendancePct > 0 && attendancePct < THRESHOLDS.attendance.warn) {
+          newAlerts.push({
+            severity: 'warning',
+            title: `Tỉ lệ tham dự cuộc họp thấp: ${Math.round(attendancePct)}%`,
+            detail: `Ngưỡng đề xuất ${THRESHOLDS.attendance.good}%. Kiểm tra các nhóm có vắng mặt cao.`,
+            to: '/meetings',
+          })
+        }
+
+        if (vd(suggR).length > 0) {
+          newAlerts.push({
+            severity: 'info',
+            title: `${vd(suggR).length} góp ý người dùng chưa xem`,
+            detail: 'Phản hồi từ cán bộ và thành viên cần được xử lý.',
+            to: '/messages?type=CUSTOMER_SUPPORT',
+          })
+        }
+
+        setAlerts(newAlerts)
+        setRecent(vd(latMtgR).map(m => ({ ...m, _type: MTG_TYPE[m.meetingType] || m.meetingType })))
+
+        // Loan purpose
         setLoan([
-          { name: 'Khẩn cấp',   value: gv('13.1') },
-          { name: 'Kinh doanh', value: gv('13.2') },
-          { name: 'Tiêu dùng',  value: gv('13.3') },
-          { name: 'Khác',       value: gv('13.4') },
+          { name: 'Khẩn cấp',   value: rpt(rptCurrR, '13.1') },
+          { name: 'Kinh doanh', value: rpt(rptCurrR, '13.2') },
+          { name: 'Tiêu dùng',  value: rpt(rptCurrR, '13.3') },
+          { name: 'Khác',       value: rpt(rptCurrR, '13.4') },
         ])
 
-        // ── Recent meetings ───────────────────────────────────────────────
-        setRecent(vd(latMR).map(m => ({
-          ...m,
-          _statusCls: MEETING_STATUS_CLS[m.status] || 'text-gray-400 bg-gray-50 border-gray-100',
-          _typeLabel: MEETING_TYPE_LABEL[m.meetingType] || m.meetingType,
-        })))
-
-        setSugg(vd(sugR))
-
-        // ── 6-month financial trend ───────────────────────────────────────
+        // ── 6-month trend ─────────────────────────────────────────────────
         const trendRes = await Promise.allSettled(
-          months.map(m =>
-            httpAuth.get(`/reports?reportType=overview_report_v2&fromDate=${m.from}&toDate=${m.to}&${buildQ()}&_start=0&_end=100`)
-          )
+          months.map(m => httpAuth.get(`/reports?reportType=overview_report_v2&fromDate=${m.from}&toDate=${m.to}&${q()}&_start=0&_end=100`))
         )
         setTrend(months.map((m, i) => {
-          if (trendRes[i].status !== 'fulfilled') return { month: m.label, Tiết_kiệm: 0, Dư_nợ: 0, Quỹ_xã_hội: 0 }
-          const rd = trendRes[i].value?.payload?.data || []
-          const g  = (id) => rd.find(r => String(r.id) === String(id))?.accumulatedValue || 0
-          return {
-            month:     m.label,
-            Tiết_kiệm:  g('5') || g('3')  || 0,
-            Dư_nợ:      g('9') || g('11') || 0,
-            Quỹ_xã_hội: g('10')|| g('14') || 0,
-          }
+          const r = (id) => (trendRes[i].status === 'fulfilled'
+            ? (trendRes[i].value?.payload?.data?.find(x => String(x.id) === String(id))?.accumulatedValue || 0)
+            : 0)
+          return { month: m.label, 'Tiết kiệm': r('5')||r('3'), 'Dư nợ': r('9')||r('11'), 'Quỹ XH': r('10')||r('14') }
         }))
 
       } catch (e) {
@@ -314,322 +388,307 @@ export default function DashboardPage() {
         setLoading(false)
       }
     }
-
     load()
-  }, [fromDate, toDate, buildQ])
+  }, [fromDate, toDate, prevFrom, prevTo, q])
 
-  // ── Derived ─────────────────────────────────────────────────────────────────
-  const repaymentPct   = finance.principal > 0 ? fmtPct(finance.repaid, finance.principal) : 0
-  const activeMemberPct = kpi.members > 0 ? fmtPct(kpi.activeMembers, kpi.members) : 0
-  const loanTotal      = useMemo(() => loanPurpose.reduce((s, d) => s + d.value, 0), [loanPurpose])
+  // ── Computed ──────────────────────────────────────────────────────────────
+  const overallHealth = useMemo(() => {
+    const scores = [
+      healthColor(meal.repaymentRate,    THRESHOLDS.repayment),
+      healthColor(meal.attendanceRate,   THRESHOLDS.attendance),
+      healthColor(meal.activeMemberRate, THRESHOLDS.activeMember),
+    ]
+    if (scores.some(s => s === 'red'))   return 'red'
+    if (scores.some(s => s === 'amber')) return 'amber'
+    if (scores.every(s => s === 'green'))return 'green'
+    return 'gray'
+  }, [meal])
 
-  const hasTrendData   = trendData.some(d => d.Tiết_kiệm > 0 || d.Dư_nợ > 0)
-  const hasFinance     = finance.savings > 0 || finance.outstanding > 0
-
-  // ── Scope label for header ──────────────────────────────────────────────────
+  const loanTotal = loanPurpose.reduce((s, d) => s + d.value, 0)
+  const hasTrend  = trendData.some(d => d['Tiết kiệm'] > 0 || d['Dư nợ'] > 0)
   const scopeLabel = useMemo(() => {
-    const parts = []
-    if (roleUser?.cityName)  parts.push(roleUser.cityName)
-    if (roleUser?.wardName)  parts.push(roleUser.wardName)
-    if (roleUser?.projectName) parts.push(roleUser.projectName)
-    return parts.join(' · ') || 'Toàn hệ thống'
+    const p = []
+    if (roleUser?.projectName)    p.push(roleUser.projectName)
+    if (roleUser?.cityName)       p.push(roleUser.cityName)
+    if (roleUser?.wardName)       p.push(roleUser.wardName)
+    return p.join(' · ') || 'Toàn hệ thống'
   }, [roleUser])
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────────
   return (
     <div className="space-y-5">
 
-      {/* ── Greeting banner + period filter ────────────────────────────────── */}
-      <div className="bg-gradient-to-r from-orange-bg to-orange-hover rounded-2xl p-5 text-white">
-        <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
-          <div>
-            <p className="text-white/70 font-inter text-[13px]">
-              {ROLE_LABEL[infoUser?.role] || infoUser?.role}
-              {scopeLabel && <span className="ml-2 opacity-60">· {scopeLabel}</span>}
-            </p>
-            <h1 className="text-xl font-bold font-manrope mt-1">
-              {greeting()}, {infoUser?.name?.split(' ').pop() || infoUser?.username} 👋
+      {/* ── 1. COMPACT HEADER + PERIOD ────────────────────────────────────── */}
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2.5">
+            <StatusDot color={overallHealth} size="w-3 h-3" pulse={overallHealth === 'red'}/>
+            <h1 className="text-[18px] font-bold font-manrope text-main-title">
+              {ROLE_LABEL[infoUser?.role] || 'Dashboard'}
             </h1>
-            <p className="text-white/60 font-inter text-[12px] mt-1">{dayjs().format('dddd, DD/MM/YYYY')}</p>
-          </div>
-
-          {/* Period picker */}
-          <div className="shrink-0">
-            <p className="text-white/70 font-inter text-[12px] mb-1">Kỳ báo cáo</p>
-            <RangePicker
-              picker="month"
-              value={period}
-              onChange={(v) => v && setPeriod(v)}
-              format="MM/YYYY"
-              allowClear={false}
-              className="rounded-xl"
-              style={{ background: 'rgba(255,255,255,0.15)', borderColor: 'rgba(255,255,255,0.3)' }}
-              presets={[
-                { label: 'Tháng này',  value: [dayjs().startOf('month'), dayjs().endOf('month')] },
-                { label: 'Quý này',    value: [dayjs().startOf('quarter'), dayjs().endOf('quarter')] },
-                { label: 'Năm nay',    value: [dayjs().startOf('year'), dayjs().endOf('year')] },
-                { label: 'Tháng trước', value: [dayjs().subtract(1,'month').startOf('month'), dayjs().subtract(1,'month').endOf('month')] },
-              ]}
-            />
-          </div>
-        </div>
-
-        {/* Banner summary numbers */}
-        <div className="hidden md:flex items-center gap-3 mt-4 flex-wrap">
-          {[
-            { label: 'Nhóm HĐ',     val: fmtVN(kpi.activeGroups) },
-            { label: 'Thành viên',   val: fmtVN(kpi.members) },
-            { label: 'Cuộc họp',     val: fmtVN(kpi.meetings) },
-            { label: 'Nhóm mới kỳ', val: `+${fmtVN(kpi.newGroups)}` },
-          ].map((s, i) => (
-            <div key={i} className="bg-white/15 rounded-xl px-3 py-2 text-center backdrop-blur-sm min-w-[80px]">
-              <p className="text-base font-bold font-manrope">{loading ? '—' : s.val}</p>
-              <p className="text-[11px] text-white/70 font-inter">{s.label}</p>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* ── Row 1: Operational KPIs ─────────────────────────────────────────── */}
-      <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
-        <KPICard
-          bg="bg-light-green" icon="🏘️"
-          label="Nhóm đang hoạt động"
-          value={fmtVN(kpi.activeGroups)}
-          sub={`${fmtVN(kpi.groups)} tổng · +${fmtVN(kpi.newGroups)} nhóm mới kỳ này`}
-          to="/groups" loading={loading}
-        />
-        <KPICard
-          bg="bg-light-purple" icon="👥"
-          label="Thành viên hoạt động"
-          value={fmtVN(kpi.activeMembers)}
-          sub={`/ ${fmtVN(kpi.members)} tổng — ${activeMemberPct}% HĐ`}
-          trend={`${activeMemberPct}%`} trendUp={activeMemberPct >= 70}
-          loading={loading}
-        />
-        <KPICard
-          bg="bg-light-orange" icon="📅"
-          label={`Cuộc họp (${period[0].format('MM/YYYY')} – ${period[1].format('MM/YYYY')})`}
-          value={fmtVN(kpi.meetings)}
-          sub={`ĐK: ${fmtVN(kpi.meetingsByType.first_meeting)}  CK: ${fmtVN(kpi.meetingsByType.last_meeting)}  TK: ${fmtVN(kpi.meetingsByType.regular_meeting)}`}
-          to="/meetings" loading={loading}
-        />
-      </div>
-
-      {/* ── Row 2: Financial KPIs ────────────────────────────────────────────── */}
-      {hasFinance || !loading ? (
-        <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
-          <KPICard
-            bg="bg-amber-50" icon="💰"
-            label="Tiết kiệm cổ phần lũy kế"
-            value={fmtM(finance.savings)}
-            sub={finance.savings > 0 ? `${fmtVN(finance.savings)} ₫` : 'Chưa có dữ liệu kỳ này'}
-            trendUp={true}
-            loading={loading}
-          />
-          <KPICard
-            bg="bg-red-50" icon="📊"
-            label="Dư nợ vay hiện tại"
-            value={fmtM(finance.outstanding)}
-            sub={finance.principal > 0 ? `Tổng giải ngân: ${fmtM(finance.principal)}` : 'Chưa có dữ liệu'}
-            loading={loading}
-          />
-          <KPICard
-            bg="bg-blue-50" icon="✅"
-            label="Tỉ lệ hoàn trả vay"
-            value={finance.principal > 0 ? `${repaymentPct}%` : 'N/A'}
-            sub={finance.repaid > 0 ? `Đã thu hồi: ${fmtM(finance.repaid)}` : 'Chưa có dữ liệu'}
-            trend={finance.principal > 0 ? `${repaymentPct}%` : undefined}
-            trendUp={repaymentPct >= 80}
-            loading={loading}
-          />
-        </div>
-      ) : null}
-
-      {/* ── Zone C: Financial trend + Health rings ──────────────────────────── */}
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-5">
-
-        {/* Area chart: Financial trend */}
-        <div className="xl:col-span-2">
-          <Section title="Xu hướng tài chính 6 tháng" subtitle="Tiết kiệm · Dư nợ · Quỹ xã hội (đơn vị: triệu đồng)">
-            {loading ? <Sk h="h-52"/> : !hasTrendData ? (
-              <div className="flex flex-col items-center justify-center h-48 text-gray-400">
-                <span className="text-3xl mb-2">📈</span>
-                <p className="font-inter text-[14px]">Dữ liệu tài chính chưa được tổng hợp</p>
-                <p className="font-inter text-[12px] mt-1">Kiểm tra cấu hình báo cáo overview_report_v2</p>
-              </div>
-            ) : (
-              <ResponsiveContainer width="100%" height={210}>
-                <AreaChart data={trendData} margin={{ top: 5, right: 5, left: 0, bottom: 0 }}>
-                  <defs>
-                    <linearGradient id="gSavings"    x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%"  stopColor="#16A34A" stopOpacity={0.2}/>
-                      <stop offset="95%" stopColor="#16A34A" stopOpacity={0}/>
-                    </linearGradient>
-                    <linearGradient id="gOutstanding" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%"  stopColor="#E4701E" stopOpacity={0.2}/>
-                      <stop offset="95%" stopColor="#E4701E" stopOpacity={0}/>
-                    </linearGradient>
-                    <linearGradient id="gSocial"     x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%"  stopColor="#9333EA" stopOpacity={0.2}/>
-                      <stop offset="95%" stopColor="#9333EA" stopOpacity={0}/>
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#F5F5F5"/>
-                  <XAxis dataKey="month" tick={{ fontSize: 11, fontFamily: 'Inter', fill: '#484746' }}/>
-                  <YAxis tickFormatter={v => fmtM(v)} tick={{ fontSize: 10, fontFamily: 'Inter', fill: '#484746' }} width={52}/>
-                  <Tooltip content={<CustomTooltip/>}/>
-                  <Legend wrapperStyle={{ fontSize: 12, fontFamily: 'Inter' }}/>
-                  <Area type="monotone" dataKey="Tiết_kiệm"   name="Tiết kiệm"   stroke="#16A34A" fill="url(#gSavings)"     strokeWidth={2} dot={false}/>
-                  <Area type="monotone" dataKey="Dư_nợ"        name="Dư nợ"       stroke="#E4701E" fill="url(#gOutstanding)"  strokeWidth={2} dot={false}/>
-                  <Area type="monotone" dataKey="Quỹ_xã_hội"  name="Quỹ xã hội"  stroke="#9333EA" fill="url(#gSocial)"      strokeWidth={2} dot={false}/>
-                </AreaChart>
-              </ResponsiveContainer>
+            {alerts.length > 0 && (
+              <span className="text-[11px] font-[700] font-inter px-2 py-0.5 rounded-full bg-red-100 text-red-700">
+                {alerts.length} cảnh báo
+              </span>
             )}
-          </Section>
+          </div>
+          <p className="text-[13px] text-gray-400 font-inter mt-0.5">{scopeLabel} · {dayjs().format('DD/MM/YYYY')}</p>
         </div>
+        <div className="shrink-0">
+          <RangePicker
+            picker="month" value={period} format="MM/YYYY" allowClear={false}
+            onChange={(v) => v && setPeriod(v)}
+            presets={[
+              { label: 'Tháng này',  value: [dayjs().startOf('month'), dayjs()] },
+              { label: 'Quý này',    value: [dayjs().startOf('quarter'), dayjs()] },
+              { label: 'Năm nay',    value: [dayjs().startOf('year'), dayjs()] },
+              { label: 'Tháng trước', value: [dayjs().subtract(1,'month').startOf('month'), dayjs().subtract(1,'month').endOf('month')] },
+            ]}
+          />
+        </div>
+      </div>
 
-        {/* Health rings */}
-        <Section title="Chỉ số sức khỏe" subtitle="Tính theo kỳ báo cáo">
+      {/* ── 2. ALERTS & EXCEPTIONS (exception-first design) ──────────────── */}
+      {(loading || alerts.length > 0) && (
+        <div className="bg-white rounded-2xl border border-light-gray p-5">
+          <div className="flex items-center gap-2 mb-3">
+            <h3 className="font-bold text-[15px] font-manrope text-main-title">Vấn đề cần chú ý</h3>
+            {!loading && <span className="text-[11px] font-inter text-gray-400">Cập nhật tự động</span>}
+          </div>
           {loading ? (
-            <div className="space-y-4"><Sk h="h-16"/><Sk h="h-16"/><Sk h="h-16"/></div>
+            <div className="space-y-2"><Sk h="h-14"/><Sk h="h-14"/></div>
+          ) : alerts.length === 0 ? (
+            <div className="flex items-center gap-2 text-green-700 bg-green-50 border border-green-200 rounded-xl p-3">
+              <span className="text-lg">✅</span>
+              <p className="text-[13px] font-inter font-[500]">Không có vấn đề nổi bật — mọi chỉ số đang ổn định.</p>
+            </div>
           ) : (
-            <div className="flex flex-col gap-4">
-              <ProgressRing
-                value={repaymentPct} max={100} color="#16A34A" size={70}
-                label="Tỉ lệ hoàn trả vay"
-                sub={finance.principal > 0 ? `${fmtM(finance.repaid)} / ${fmtM(finance.principal)}` : 'Chưa có dữ liệu'}
-              />
-              <div className="h-px bg-light-gray"/>
-              <ProgressRing
-                value={kpi.activeMembers} max={kpi.members} color="#E4701E" size={70}
-                label="Thành viên hoạt động"
-                sub={`${fmtVN(kpi.activeMembers)} / ${fmtVN(kpi.members)}`}
-              />
-              <div className="h-px bg-light-gray"/>
-              {finance.socialFund > 0 && (
-                <>
-                  <div className="bg-light-purple rounded-xl p-3">
-                    <p className="text-[12px] text-gray-text font-inter">Quỹ xã hội khả dụng</p>
-                    <p className="text-base font-bold font-manrope text-main-title mt-0.5">{fmtM(finance.socialFund)} ₫</p>
-                  </div>
-                </>
-              )}
-              {finance.interest > 0 && (
-                <div className="bg-light-green rounded-xl p-3">
-                  <p className="text-[12px] text-gray-text font-inter">Lãi thu được kỳ này</p>
-                  <p className="text-base font-bold font-manrope text-main-title mt-0.5">{fmtM(finance.interest)} ₫</p>
-                </div>
-              )}
+            <div className="space-y-2">
+              {alerts.map((a, i) => <AlertItem key={i} {...a}/>)}
             </div>
           )}
-        </Section>
+        </div>
+      )}
+
+      {/* ── 3. IMPACT & COVERAGE (Government view) ───────────────────────── */}
+      <div>
+        <p className="text-[11px] font-inter font-[600] text-gray-400 uppercase tracking-wider mb-2 px-1">
+          Phạm vi tác động
+        </p>
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+          <ImpactStat icon="🏘️"
+            value={fmtVN(impact.activeGroups)}
+            label="Nhóm VSLA đang hoạt động"
+            sub={`/ ${fmtVN(impact.totalGroups)} tổng`}
+            loading={loading}
+          />
+          <ImpactStat icon="👥"
+            value={fmtVN(impact.totalMembers)}
+            label="Thành viên tiếp cận TCDM"
+            sub={`${fmtVN(impact.activeMembers)} đang hoạt động`}
+            loading={loading}
+          />
+          <ImpactStat icon="💵"
+            value={fmtM(finance.savings + finance.outstanding + finance.socialFund)}
+            label="Tổng vốn lưu thông cộng đồng"
+            sub="Tiết kiệm + Dư nợ + Quỹ XH"
+            loading={loading}
+          />
+          <ImpactStat icon="💰"
+            value={impact.totalMembers > 0 && finance.savings > 0
+              ? `${fmtM(finance.savings / impact.totalMembers)} ₫`
+              : '—'}
+            label="Tiết kiệm bình quân / người"
+            sub="Chỉ số bao phủ tài chính"
+            loading={loading}
+          />
+        </div>
       </div>
 
-      {/* ── Zone D: Loan purpose + Meeting compliance ───────────────────────── */}
+      {/* ── 4. MEAL SCORECARD ─────────────────────────────────────────────── */}
+      <div>
+        <p className="text-[11px] font-inter font-[600] text-gray-400 uppercase tracking-wider mb-2 px-1">
+          Chỉ số MEAL — kỳ {period[0].format('MM/YYYY')}
+        </p>
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+          <ThresholdMeter
+            value={meal.repaymentRate}
+            threshold={THRESHOLDS.repayment}
+            label="Tỉ lệ hoàn trả vay"
+            sub={finance.principal > 0 ? `${fmtM(finance.repaid)} / ${fmtM(finance.principal)}` : 'Chưa có dữ liệu'}
+            delta={mealDelta.repaymentRate}
+            loading={loading}
+          />
+          <ThresholdMeter
+            value={Math.round(meal.attendanceRate)}
+            threshold={THRESHOLDS.attendance}
+            label="Tỉ lệ tham dự cuộc họp"
+            sub={`Ngưỡng đề xuất: ${THRESHOLDS.attendance.good}%`}
+            delta={Math.round(mealDelta.attendanceRate)}
+            loading={loading}
+          />
+          <ThresholdMeter
+            value={meal.activeMemberRate}
+            threshold={THRESHOLDS.activeMember}
+            label="Thành viên hoạt động"
+            sub={`${fmtVN(impact.activeMembers)} / ${fmtVN(impact.totalMembers)}`}
+            delta={mealDelta.activeMemberRate}
+            loading={loading}
+          />
+          <ThresholdMeter
+            value={meal.meetingCompliance}
+            threshold={THRESHOLDS.meetingCompliance}
+            label="Nhóm có cuộc họp gần đây"
+            sub="Trong vòng 45 ngày qua"
+            loading={loading}
+          />
+        </div>
+      </div>
+
+      {/* ── 5. FINANCIAL HEALTH + TREND ──────────────────────────────────── */}
+      <div>
+        <p className="text-[11px] font-inter font-[600] text-gray-400 uppercase tracking-wider mb-2 px-1">
+          Sức khỏe tài chính
+        </p>
+        <div className="grid grid-cols-1 xl:grid-cols-3 gap-5">
+
+          {/* Financial KPI cards */}
+          <div className="space-y-3">
+            {[
+              { label: 'Tiết kiệm cổ phần lũy kế',  value: finance.savings,     color: 'text-green-700',  bg: 'bg-green-50',  border: 'border-green-200' },
+              { label: 'Dư nợ vay hiện tại',         value: finance.outstanding, color: 'text-orange-bg',  bg: 'bg-orange-50', border: 'border-orange-200' },
+              { label: 'Quỹ xã hội & Vacxin',        value: finance.socialFund,  color: 'text-purple-700', bg: 'bg-purple-50', border: 'border-purple-200' },
+              { label: 'Lãi thu trong kỳ',           value: finance.interest,    color: 'text-blue-700',   bg: 'bg-blue-50',   border: 'border-blue-200' },
+            ].map((item, i) => (
+              <div key={i} className={`rounded-xl border p-3.5 ${item.bg} ${item.border} flex items-center justify-between gap-3`}>
+                <p className="text-[12px] text-gray-text font-inter leading-tight">{item.label}</p>
+                {loading
+                  ? <Sk h="h-7" w="w-24 shrink-0"/>
+                  : <p className={`text-lg font-bold font-manrope shrink-0 ${item.color}`}>
+                      {item.value > 0 ? `${fmtM(item.value)} ₫` : '—'}
+                    </p>
+                }
+              </div>
+            ))}
+          </div>
+
+          {/* Area chart — financial trend */}
+          <div className="xl:col-span-2">
+            <Section title="Xu hướng tài chính 6 tháng" subtitle="Tiết kiệm · Dư nợ · Quỹ xã hội">
+              {loading ? <Sk h="h-52"/> : !hasTrend ? (
+                <div className="flex flex-col items-center justify-center h-48 text-gray-400">
+                  <p className="font-inter text-[14px]">Chưa có dữ liệu tài chính tổng hợp</p>
+                  <p className="font-inter text-[12px] mt-1 text-center max-w-xs">
+                    Kiểm tra cấu hình data_key trong overview_report_v2
+                  </p>
+                </div>
+              ) : (
+                <ResponsiveContainer width="100%" height={210}>
+                  <AreaChart data={trendData} margin={{ top: 5, right: 5, left: 0, bottom: 0 }}>
+                    <defs>
+                      {[['s', '#16A34A'], ['l', '#E4701E'], ['f', '#9333EA']].map(([id, c]) => (
+                        <linearGradient key={id} id={`g${id}`} x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="5%"  stopColor={c} stopOpacity={0.2}/>
+                          <stop offset="95%" stopColor={c} stopOpacity={0}/>
+                        </linearGradient>
+                      ))}
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#F5F5F5"/>
+                    <XAxis dataKey="month" tick={{ fontSize: 11, fontFamily: 'Inter', fill: '#484746' }}/>
+                    <YAxis tickFormatter={v => fmtM(v)} tick={{ fontSize: 10, fontFamily: 'Inter', fill: '#484746' }} width={48}/>
+                    <Tooltip content={<CustomTooltip/>}/>
+                    <Area type="monotone" dataKey="Tiết kiệm" stroke="#16A34A" fill="url(#gs)" strokeWidth={2} dot={false}/>
+                    <Area type="monotone" dataKey="Dư nợ"     stroke="#E4701E" fill="url(#gl)" strokeWidth={2} dot={false}/>
+                    <Area type="monotone" dataKey="Quỹ XH"    stroke="#9333EA" fill="url(#gf)" strokeWidth={2} dot={false}/>
+                  </AreaChart>
+                </ResponsiveContainer>
+              )}
+            </Section>
+          </div>
+        </div>
+      </div>
+
+      {/* ── 6. LOAN PORTFOLIO + RECENT MEETINGS ──────────────────────────── */}
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-5">
 
-        {/* Loan purpose bar */}
-        <Section title="Cho vay theo mục đích" subtitle={loanTotal > 0 ? `Lũy kế ${fmtVN(loanTotal)} khoản` : 'Kỳ này'}>
+        {/* Loan purpose — MEAL / project manager analysis */}
+        <Section title="Cho vay theo mục đích" subtitle={loanTotal > 0 ? `${fmtVN(loanTotal)} khoản lũy kế` : 'Kỳ này'}>
           {loading ? <Sk h="h-44"/> : loanTotal === 0 ? (
             <p className="text-center text-gray-400 font-inter text-[13px] py-8">Chưa có dữ liệu cho vay</p>
           ) : (
-            <ResponsiveContainer width="100%" height={180}>
-              <BarChart data={loanPurpose} margin={{ top: 0, right: 0, left: -20, bottom: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#F5F5F5"/>
-                <XAxis dataKey="name" tick={{ fontSize: 10, fontFamily: 'Inter', fill: '#484746' }}/>
-                <YAxis tick={{ fontSize: 10, fontFamily: 'Inter', fill: '#484746' }}/>
-                <Tooltip content={<CustomTooltip/>}/>
-                <Bar dataKey="value" name="Số khoản" radius={[5, 5, 0, 0]}>
-                  {loanPurpose.map((_, i) => <Cell key={i} fill={LOAN_COLORS[i % LOAN_COLORS.length]}/>)}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
+            <>
+              <ResponsiveContainer width="100%" height={160}>
+                <BarChart data={loanPurpose} margin={{ top: 0, right: 0, left: -22, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#F5F5F5"/>
+                  <XAxis dataKey="name" tick={{ fontSize: 10, fontFamily: 'Inter', fill: '#484746' }}/>
+                  <YAxis tick={{ fontSize: 10, fontFamily: 'Inter', fill: '#484746' }}/>
+                  <Tooltip content={<CustomTooltip/>}/>
+                  <Bar dataKey="value" name="Khoản" radius={[5,5,0,0]}>
+                    {loanPurpose.map((_, i) => (
+                      <Cell key={i} fill={['#16A34A','#E4701E','#4079ED','#9333EA'][i]}/>
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+              {/* % breakdown */}
+              <div className="mt-3 space-y-1.5">
+                {loanPurpose.filter(d => d.value > 0).map((d, i) => (
+                  <div key={i} className="flex items-center gap-2">
+                    <div className="h-1.5 rounded-full shrink-0" style={{ width: `${pct(d.value, loanTotal)}%`, minWidth: 4, background: ['#16A34A','#E4701E','#4079ED','#9333EA'][i]}}/>
+                    <span className="text-[11px] text-gray-400 font-inter shrink-0">{d.name} {pct(d.value, loanTotal)}%</span>
+                  </div>
+                ))}
+              </div>
+            </>
           )}
         </Section>
 
-        {/* Meeting compliance breakdown */}
+        {/* Recent meetings with type breakdown */}
         <div className="xl:col-span-2">
-          <Section title="Tuân thủ cuộc họp" subtitle={`Kỳ ${period[0].format('MM/YYYY')} – ${period[1].format('MM/YYYY')}`} to="/meetings">
+          <Section title="Cuộc họp gần nhất" subtitle="Hoạt động thực địa" to="/meetings">
             {loading ? (
-              <div className="space-y-4"><Sk h="h-16"/><div className="grid grid-cols-3 gap-3"><Sk h="h-20"/><Sk h="h-20"/><Sk h="h-20"/></div></div>
+              <div className="space-y-2">{[...Array(5)].map((_,i) => <Sk key={i} h="h-14"/>)}</div>
+            ) : recentMtg.length === 0 ? (
+              <p className="text-center text-gray-400 font-inter text-[13px] py-6">Chưa có cuộc họp nào</p>
             ) : (
-              <>
-                {/* Total + breakdown badges */}
-                <div className="grid grid-cols-3 gap-3 mb-4">
-                  <MeetingBadge type="first_meeting"   count={kpi.meetingsByType.first_meeting}   loading={loading}/>
-                  <MeetingBadge type="last_meeting"    count={kpi.meetingsByType.last_meeting}    loading={loading}/>
-                  <MeetingBadge type="regular_meeting" count={kpi.meetingsByType.regular_meeting} loading={loading}/>
-                </div>
-
-                {/* Risk flag: no last_meeting (groups haven't closed the cycle) */}
-                {kpi.meetingsByType.last_meeting === 0 && kpi.meetings > 0 && (
-                  <div className="flex items-start gap-3 bg-red-50 border border-red-100 rounded-xl p-3 mb-4">
-                    <span className="text-red-500 text-lg shrink-0 mt-0.5">⚠️</span>
-                    <div>
-                      <p className="text-[13px] font-[600] text-red-700 font-manrope">Không có cuộc họp cuối kỳ</p>
-                      <p className="text-[12px] text-red-600 font-inter mt-0.5">
-                        Kỳ này chưa ghi nhận cuộc họp cuối kỳ nào. Kiểm tra các nhóm chưa kết thúc chu kỳ.
-                      </p>
-                    </div>
-                  </div>
-                )}
-
-                {/* Recent meetings list */}
-                {recentMtg.length === 0 ? (
-                  <p className="text-center text-gray-400 font-inter text-[13px] py-4">Chưa có cuộc họp nào</p>
-                ) : (
-                  <div className="space-y-1.5">
-                    {recentMtg.slice(0, 5).map((m, i) => (
-                      <div key={i} className="flex items-center gap-2 p-2.5 rounded-xl hover:bg-gray-50 transition-colors">
-                        <div className="shrink-0 w-1 h-8 rounded-full bg-orange-bg"/>
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-1.5 flex-wrap">
-                            <Link to={`/groups/detailgroup/${m.groupId}`}
-                              className="font-[500] text-[13px] text-main-title font-inter truncate hover:text-orange-bg">
-                              {m.groupName}
-                            </Link>
-                            <span className="text-[11px] text-gray-400 shrink-0">{m._typeLabel}</span>
-                          </div>
-                          {m.date && (
-                            <p className="text-[11px] text-gray-400 font-inter">
-                              {dayjs(m.date).format('HH:mm DD/MM/YY')}
-                              {m.location && ` · ${m.location}`}
-                            </p>
-                          )}
+              <div className="space-y-1.5">
+                {recentMtg.map((m, i) => {
+                  const typeCls = {
+                    first_meeting:   'bg-purple-50 text-purple-700',
+                    last_meeting:    'bg-blue-50 text-blue-700',
+                    regular_meeting: 'bg-green-50 text-green-700',
+                  }[m.meetingType] || 'bg-gray-50 text-gray-600'
+                  const statusDone = m.status === 'Done'
+                  return (
+                    <div key={i} className="flex items-center gap-3 p-2.5 rounded-xl hover:bg-gray-50 transition-colors group">
+                      <div className={`shrink-0 w-1 h-10 rounded-full ${statusDone ? 'bg-blue-400' : 'bg-green-400'}`}/>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <Link to={`/groups/detailgroup/${m.groupId}`}
+                            className="font-[500] text-[13px] text-main-title font-inter hover:text-orange-bg truncate">
+                            {m.groupName}
+                          </Link>
+                          <span className={`text-[10px] font-[600] px-2 py-0.5 rounded-full font-inter shrink-0 ${typeCls}`}>
+                            {m._type}
+                          </span>
                         </div>
-                        <span className={`shrink-0 text-[11px] font-[500] px-2 py-0.5 rounded-lg border font-inter ${m._statusCls}`}>
-                          {m.status === 'Done' ? 'Xong' : 'Đang họp'}
-                        </span>
+                        <p className="text-[11px] text-gray-400 font-inter mt-0.5">
+                          {m.date ? dayjs(m.date).format('HH:mm · DD/MM/YY') : ''}
+                          {m.location ? ` · ${m.location}` : ''}
+                        </p>
                       </div>
-                    ))}
-                  </div>
-                )}
-              </>
+                      <span className={`shrink-0 text-[11px] font-[500] font-inter px-2 py-0.5 rounded-lg border
+                        ${statusDone ? 'text-blue-600 bg-blue-50 border-blue-100' : 'text-green-600 bg-green-50 border-green-100'}`}>
+                        {statusDone ? 'Xong' : 'Đang họp'}
+                      </span>
+                    </div>
+                  )
+                })}
+              </div>
             )}
           </Section>
         </div>
       </div>
-
-      {/* ── Zone E: Suggestions (reduced priority) ──────────────────────────── */}
-      {suggestions.length > 0 && (
-        <Section title="Góp ý từ người dùng" to="/messages?type=CUSTOMER_SUPPORT" subtitle="Phản hồi gần nhất">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-            {suggestions.map((msg, i) => (
-              <Link key={i} to={`/messages/view/${msg.id}`}
-                className="block p-3 rounded-xl hover:bg-orange-bg/5 border border-transparent hover:border-orange-bg/20 transition-colors">
-                <div className="flex justify-between items-start gap-2">
-                  <p className="font-[500] text-[13px] text-main-title font-manrope line-clamp-1">{msg.title}</p>
-                  <span className="text-[11px] text-gray-400 font-inter shrink-0">
-                    {msg.sendDate ? dayjs(msg.sendDate).format('DD/MM') : ''}
-                  </span>
-                </div>
-                <p className="text-[12px] text-gray-text font-inter mt-0.5 line-clamp-1">{msg.content}</p>
-              </Link>
-            ))}
-          </div>
-        </Section>
-      )}
 
     </div>
   )
