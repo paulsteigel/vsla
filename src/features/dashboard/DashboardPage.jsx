@@ -229,7 +229,12 @@ const ChartTip = ({active, payload, label}) => {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 export default function DashboardPage() {
   const { infoUser, roleUser } = useAuthStore()
-  const [period, setPeriod] = useState([dayjs().startOf('month'), dayjs()])
+  // Default: tháng trước vì overview_report chỉ có data cho tháng đã kết thúc
+  // (cron INSERT cuối tháng, tháng hiện tại chưa có record)
+  const [period, setPeriod] = useState([
+    dayjs().subtract(1,'month').startOf('month'),
+    dayjs().subtract(1,'month').endOf('month'),
+  ])
 
   const fromDate = period[0].format('YYYY-MM-DD')
   const toDate   = period[1].format('YYYY-MM-DD')
